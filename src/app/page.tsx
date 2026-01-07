@@ -12,10 +12,15 @@ import chinaGeoJson from "../assets/china.json";
 const width = 960;
 const height = 600;
 
-// 省份属性：我们只关心 name（用于按名字查找/聚焦），其它字段保持 unknown
-type ProvinceProperties = { name?: string } & Record<string, unknown>;
+// 省份属性：我们关心 name（按名字查找/聚焦）和 id（用于加载细节 GeoJSON）
+// 其它字段保持 unknown（不影响示例逻辑）
+type ProvinceProperties = { id?: string; name?: string } & Record<string, unknown>;
 // 单个省份的 Feature（几何 + 属性）
 type ProvinceFeature = Feature<Geometry, ProvinceProperties>;
+
+// 省份“细节”数据是任意一种可被 d3.geoPath 渲染的 GeoJSON 对象
+// （Feature / FeatureCollection / Geometry）
+type DetailGeo = d3.GeoPermissibleObjects;
 
 export default function Home() {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
@@ -51,9 +56,10 @@ export default function Home() {
     // 为什么：scene 变换后，里面的地图、连线、标记都会一起移动
     const scene = svg.append("g").attr("class", "scene");
     const mapLayer = scene.append("g").attr("class", "map");
-    // 注意：SVG 的绘制顺序是“后画的在上面”（类似图层）。
-    // 如果 linksLayer 在 mapLayer 下面，红线会被省份的 fill 盖住，看起来像“没画出来”。
-    // 所以我们把 linksLayer 放到 mapLayer 之后创建，让连线永远在地图上方。
+    // 细节图层：显示“当前聚焦省份”的更细粒度 GeoJSON（例如地市边界）
+    // 说明：我们把它放在 mapLayer 上方，这样细节线不会被省份的 fill 盖住
+    const detailLayer = scene.append("g").attr("class", "detail");
+    // tour 连线层：放最上面，保证永远不被盖住（SVG 后画的在上面）
     const linksLayer = scene.append("g").attr("class", "links");
 
     // 6) 画省份（path）
@@ -73,6 +79,77 @@ export default function Home() {
       const n = f.properties?.name;
       if (typeof n === "string") byName.set(n, f);
     }
+
+    // 7.1) 细节 GeoJSON 的缓存：同一个省第二次聚焦时，避免重复网络请求
+    const detailCache = new Map<string, DetailGeo>();
+    // 用一个自增 token 解决“并发请求乱序”：
+    // 假设你很快地连续聚焦 A -> B，A 的网络返回更慢，可能会把 B 的细节覆盖掉。
+    // 我们用 token 只允许最后一次请求生效。
+    let detailRequestToken = 0;
+
+    // 把 unknown 判断成普通对象（用于安全地读取 obj.type / obj.features）
+    const isRecord = (v: unknown): v is Record<string, unknown> =>
+      typeof v === "object" && v !== null;
+
+    // 7.2) 将 “任意 GeoJSON（FeatureCollection/Feature/Geometry）” 转成可绘制数组
+    // 为什么：d3.geoPath 可以直接画 Feature / Geometry；FeatureCollection 需要拆成 features
+    const toDrawables = (
+      geo: DetailGeo,
+    ): d3.GeoPermissibleObjects[] => {
+      // FeatureCollection 需要拆开画；其它类型直接画即可
+      if (isRecord(geo) && geo["type"] === "FeatureCollection") {
+        const featuresValue = geo["features"];
+        if (Array.isArray(featuresValue)) {
+          return featuresValue as d3.GeoPermissibleObjects[];
+        }
+      }
+      return [geo];
+    };
+
+    // 7.3) 按省份 id 加载细节 GeoJSON：GET /provinces/{id}.json
+    // 注意：这是方案 A（public 静态资源 + 按需 fetch）
+    const loadDetailById = async (id: string): Promise<DetailGeo | null> => {
+      const cached = detailCache.get(id);
+      if (cached) return cached;
+
+      const url = `/provinces/${id}.json`;
+      try {
+        const geo = await d3.json<DetailGeo>(url);
+        if (!geo) return null;
+        detailCache.set(id, geo);
+        return geo;
+      } catch (err) {
+        // 初学提示：这里通常是文件不存在 / 路径不对 / JSON 格式错误
+        console.warn(`细节 GeoJSON 加载失败：${url}`, err);
+        return null;
+      }
+    };
+
+    // 7.4) 显示当前省份的细节边界（叠加在 detailLayer 上）
+    const showDetail = async (feature: ProvinceFeature) => {
+      // 每次聚焦都先清空 detailLayer，避免看到上一个省的细节残留
+      detailLayer.selectAll("*").remove();
+
+      const id = feature.properties?.id;
+      if (typeof id !== "string" || id.trim() === "") return;
+
+      const token = ++detailRequestToken;
+      const geo = await loadDetailById(id);
+      if (token !== detailRequestToken) return; // 有更新的请求了，本次丢弃
+      if (!geo) return;
+
+      const drawables = toDrawables(geo);
+
+      detailLayer
+        .selectAll<SVGPathElement, d3.GeoPermissibleObjects>("path")
+        .data(drawables)
+        .join("path")
+        .attr("d", (d) => path(d) ?? "")
+        .attr("fill", "none")
+        .attr("stroke", "#2563eb")
+        .attr("stroke-width", 1)
+        .attr("opacity", 0.95);
+    };
 
     // 小工具：延时，让 tour 的节奏更自然
     const delay = (ms: number) =>
@@ -178,6 +255,8 @@ export default function Home() {
         .attr("transform", t.toString());
 
       await tr.end();
+      // 动画结束后再加载/绘制细节：这样细节会“在抵达后出现”，更符合 tour 语义
+      await showDetail(feature);
     };
 
     // 13) Demo tour：江西省 -> 上海市
@@ -190,6 +269,7 @@ export default function Home() {
       // 第一帧：直接定位到江西（不做动画），避免初始闪动
       highlight("江西省");
       scene.attr("transform", transformFor(jiangxi).toString());
+      await showDetail(jiangxi);
 
       await delay(600);
 
